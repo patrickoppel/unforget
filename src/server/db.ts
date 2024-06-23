@@ -2,12 +2,28 @@ import type * as t from '../common/types.js';
 import * as cutil from '../common/util.js';
 import Database, { Statement } from 'better-sqlite3';
 import path from 'node:path';
+import fs from 'node:fs';
 import _ from 'lodash';
 
 let db: Database.Database;
 
 export function initDB() {
-  const dbPath = path.join('private/unforget.db');
+   // Use import.meta.url to get the current file URL, then convert it to a directory path
+   const currentFileUrl = new URL(import.meta.url);
+   const currentDirPath = path.dirname(currentFileUrl.pathname);
+ 
+   // Correct path for Windows environments
+   const correctedPath = process.platform === "win32" ? currentDirPath.substring(1) : currentDirPath;
+ 
+   // Define the directory and db file path
+   const dbDirectory = path.join(correctedPath, 'private');
+  const dbPath = path.join(dbDirectory, 'unforget.db');
+
+  // Ensure the directory exists
+  if (!fs.existsSync(dbDirectory)) {
+    fs.mkdirSync(dbDirectory, { recursive: true });
+  }
+
   const dbLog = (..._args: any[]) => {
     // if (process.env.NODE_ENV === 'development') {
     //   console.log('sqlite: ', ...args);

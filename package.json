@@ -29,8 +29,8 @@
     "encrypted"
   ],
   "license": "MIT",
-  "homepage": "https://unforget.computing-den.com/demo",
-  "repository": "github:computing-den/unforget",
+  "homepage": "localhost:3000",
+  "repository": "github:patrickoppel/unforget",
   "engines": {
     "node": ">=18.19.0"
   },
