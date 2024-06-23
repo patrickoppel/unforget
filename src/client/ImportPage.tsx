@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import type * as t from '../common/types.js';
-import { createNewNote } from '../common/util.js';
+import { createNewNote, assert } from '../common/util.js';
 import * as actions from './appStoreActions.jsx';
 import { PageLayout, PageHeader, PageBody } from './PageLayout.jsx';
 import { Notes } from './Notes.jsx';
@@ -10,22 +10,39 @@ import { unzip } from 'unzipit';
 import { v4 as uuid } from 'uuid';
 import importMd from './notes/import.md';
 
-const importNote = createNewNote(importMd);
+const initialImportNote = createNewNote(importMd);
+
+const importers = {
+  '#keep': importKeep,
+  '#apple': importApple,
+  '#standard': importStandard,
+};
+
+type ImportKeys = keyof typeof importers;
 
 export function ImportPage() {
   // const app = appStore.use();
 
   // const [file, setFile] = useState<File>();
   const [importing, setImporting] = useState(false);
+  const [importType, setImportType] = useState<ImportKeys>();
+  const [note, setNote] = useState(initialImportNote);
 
   async function importCb(e: React.ChangeEvent<HTMLInputElement>) {
     try {
       const newFile = e.target.files?.[0];
       // setFile(newFile);
       if (!newFile) return;
-
       setImporting(true);
-      await importFromZipFile(newFile);
+      assert(importType, 'Unknown import type');
+      const notes = await importers[importType](newFile, note);
+
+      if (notes.length) {
+        await actions.saveNotes(notes, { message: `Imported ${notes.length} notes`, immediateSync: true });
+      } else {
+        actions.showMessage('No notes were found');
+      }
+
       window.history.replaceState(null, '', '/');
     } catch (error) {
       actions.gotError(error as Error);
@@ -34,25 +51,9 @@ export function ImportPage() {
     }
   }
 
-  function triggerFileInput() {
+  function hashLinkClicked(hash: string) {
+    setImportType(hash as ImportKeys);
     (document.querySelector('input[type="file"]') as HTMLInputElement).click();
-  }
-
-  // const notes: t.Note[] = [
-  //   {
-  //     id: 'google-keep',
-  //     text: importGoogleKeepNoteText,
-  //     creation_date: '2024-04-17T15:32:18.337Z',
-  //     modification_date: '2024-04-17T15:32:18.337Z',
-  //     not_deleted: 1,
-  //     not_archived: 1,
-  //     pinned: 0,
-  //     order: 1,
-  //   },
-  // ];
-
-  function hashLinkClicked(_hash: string) {
-    triggerFileInput();
   }
 
   return (
@@ -60,7 +61,7 @@ export function ImportPage() {
       <PageHeader title="/ import" />
       <PageBody>
         <div className="page">
-          {!importing && <Notes notes={[importNote]} readonly onHashLinkClick={hashLinkClicked} />}
+          {!importing && <Notes notes={[note]} onHashLinkClick={hashLinkClicked} onNoteChange={setNote} />}
           {!importing && (
             <input type="file" name="file" accept="application/zip" onChange={importCb} style={{ display: 'none' }} />
           )}
@@ -93,7 +94,9 @@ export function ImportPage() {
   );
 }
 
-async function importFromZipFile(zipFile: File) {
+async function importKeep(zipFile: File, note: t.Note): Promise<t.Note[]> {
+  const optIncludeTags = hasOption(note.text!, 'include labels as tags');
+
   const { entries } = await unzip(zipFile);
 
   const regexp = /^Takeout\/Keep\/[^\/]+\.json$/;
@@ -116,6 +119,7 @@ async function importFromZipFile(zipFile: File) {
       (json.listContent || [])
         .map((item: any) => (item.isChecked ? `- [x] ${item.text || ''}` : `- [ ] ${item.text || ''}`))
         .join('\n'),
+      optIncludeTags && json.labels?.map((x: any) => '#' + x.name).join(' '),
     ];
     const text = segments.filter(Boolean).join('\n\n');
 
@@ -131,11 +135,7 @@ async function importFromZipFile(zipFile: File) {
     });
   }
 
-  if (notes.length) {
-    await actions.saveNotes(notes, { message: `Imported ${notes.length} notes`, immediateSync: true });
-  } else {
-    actions.showMessage('No notes were found');
-  }
+  return notes;
 }
 
 function validateGoogleKeepJson(json: any): string | undefined {
@@ -148,4 +148,79 @@ function validateGoogleKeepJson(json: any): string | undefined {
   // if (!('isArchived' in json)) return 'Missing isArchived';
   // if (!('listContent' in json) && !('textContent' in json)) return 'Missing listContent and textContent';
   // if (!('title' in json) && !('title' in json)) return 'Missing title';
+}
+
+async function importApple(zipFile: File, note: t.Note): Promise<t.Note[]> {
+  const optIncludeTags = hasOption(note.text!, 'include folder names as tags');
+
+  const { entries } = await unzip(zipFile);
+  const regexp = /^.*-(\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ)\.txt$/;
+  const notes: t.Note[] = [];
+
+  for (const entry of Object.values(entries)) {
+    const parts = entry.name.split('/');
+    if (parts.includes('Recently Deleted')) continue;
+
+    const match = parts.at(-1)?.match(regexp);
+    if (!match) continue;
+
+    const date = new Date(match[1]);
+
+    let text = await entry.text();
+    if (optIncludeTags) {
+      const tags = parts
+        .slice(1, -2)
+        .map(x => '#' + x.replace(' ', '-'))
+        .join(' ');
+      text += '\n\n' + tags;
+    }
+
+    notes.push({
+      id: uuid(),
+      text,
+      creation_date: date.toISOString(),
+      modification_date: date.toISOString(),
+      order: date.valueOf(),
+      not_deleted: 1,
+      not_archived: 1,
+      pinned: 0,
+    });
+  }
+  return notes;
+}
+
+async function importStandard(zipFile: File): Promise<t.Note[]> {
+  const { entries } = await unzip(zipFile);
+  const regexp = /^([^\/]+)\.txt$/;
+  const notes: t.Note[] = [];
+  const startMs = Date.now();
+
+  for (const [i, entry] of Object.values(entries).entries()) {
+    const match = entry.name.match(regexp);
+    if (!match) continue;
+
+    const entryText = await entry.text();
+    const title = match[1];
+    const text = title + '\n\n' + entryText;
+
+    notes.push({
+      id: uuid(),
+      text,
+      creation_date: new Date(startMs - i).toISOString(),
+      modification_date: new Date(startMs - i).toISOString(),
+      order: startMs - i,
+      not_deleted: 1,
+      not_archived: 1,
+      pinned: 0,
+    });
+  }
+
+  return notes;
+}
+
+function hasOption(text: string, label: string): boolean {
+  const regexp = new RegExp('^\\s*- \\[(.)\\] ' + label + '$', 'm');
+  const match = text.match(regexp);
+  assert(match, `option "${label}" doesn't exist.`);
+  return match[1] === 'x';
 }
