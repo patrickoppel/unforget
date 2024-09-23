@@ -8,10 +8,12 @@ import * as appStore from './appStore.js';
 import * as actions from './appStoreActions.jsx';
 import log from './logger.js';
 import { Editor, EditorContext } from './Editor.jsx';
-import { PageLayout, PageHeader, PageBody, PageAction } from './PageLayout.jsx';
+import { PageLayout, PageHeader, PageBody, PageAction, type PageHeaderSecondRowProps } from './PageLayout.jsx';
 import _ from 'lodash';
 import * as icons from './icons.js';
 import { Notes } from './Notes.jsx';
+import * as b from './cross-context-broadcast.js';
+import { addSyncEventListener, removeSyncEventListener, type SyncEvent } from './sync.js';
 // import log from './logger.js';
 
 type NotesPageProps = {};
@@ -21,17 +23,32 @@ export function NotesPage(_props: NotesPageProps) {
   const [newNote, setNewNote] = useState<t.Note>();
   // const [newNoteText, setNewNoteText] = useState('');
   // const [newNotePinned, setNewNotePinned] = useState(false);
-  const [editing, setEditing] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
   const [editorFocused, setEditorFocused] = useState(false);
   const [stickyEditor, setStickyEditor] = useState(false);
   const editorRef = useRef<EditorContext | null>(null);
   useStoreAndRestoreScrollY();
 
-  // Check for changes in storage and update the notes.
+  // Check for changes in storage initiated externally or internally and update the notes.
   useEffect(() => {
-    // log('NotesPage received notesInStorageChangedExternally');
-    window.addEventListener('notesInStorageChangedExternally', actions.updateNotes);
-    return () => window.removeEventListener('notesInStorageChangedExternally', actions.updateNotes);
+    function handleBroadcastMessage(message: t.BroadcastChannelMessage) {
+      if (message.type === 'notesInStorageChanged') {
+        actions.updateNotes();
+      }
+    }
+
+    function handleSyncEvent(e: SyncEvent) {
+      if (e.type === 'mergedNotes') {
+        actions.updateNotes();
+      }
+    }
+
+    b.addListener(handleBroadcastMessage); // External changes.
+    addSyncEventListener(handleSyncEvent); // Internal changes.
+    return () => {
+      removeSyncEventListener(handleSyncEvent);
+      b.removeListener(handleBroadcastMessage);
+    };
   }, []);
 
   // Keyboard shortcuts.
@@ -46,38 +63,73 @@ export function NotesPage(_props: NotesPageProps) {
 
       if (e.key === 'Enter' && ctrlOrMeta) {
         handle(confirmNewNoteCb);
-      } else if (e.key === 'Escape') {
-        handle(confirmNewNoteCb);
-      } else if (e.key === 'Delete' && ctrlOrMeta) {
+      } else if (e.key === 'Escape' && !ctrlOrMeta) {
+        if (editorOpen) {
+          handle(confirmNewNoteCb);
+        } else if (app.noteSelection) {
+          handle(toggleNoteSelectionMode);
+        }
+      } else if (e.key === 'Delete' && e.shiftKey && ctrlOrMeta) {
         handle(cancelNewNoteCb);
       } else if (e.key === '.' && ctrlOrMeta) {
         handle(cycleListStyleCb);
       } else if (e.key === 'p' && ctrlOrMeta) {
         handle(togglePinned);
+      } else if (e.key === 'ArrowUp' && e.shiftKey && ctrlOrMeta) {
+        handle(actions.moveNoteSelectionToTop);
+      } else if (e.key === 'ArrowDown' && e.shiftKey && ctrlOrMeta) {
+        handle(actions.moveNoteSelectionToBottom);
+      } else if (e.key === 'ArrowUp' && ctrlOrMeta) {
+        handle(actions.moveNoteSelectionUp);
+      } else if (e.key === 'ArrowDown' && ctrlOrMeta) {
+        handle(actions.moveNoteSelectionDown);
       }
 
+      // Ignore the following shortcuts if input or textarea is focused
+      // or if ctrl or meta key is pressed
       if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName ?? '')) return;
+      if (ctrlOrMeta) return;
 
       if (e.key === '/') {
         if (app.search) {
           handle(() => document.getElementById('search-input')?.focus());
         } else {
-          handle(toggleSearchCb);
+          handle(toggleNoteSearchCb);
         }
       } else if (e.key === 'p') {
         handle(toggleHidePinnedNotes);
       } else if (e.key === 'n') {
-        if (editing) {
+        if (editorOpen) {
           handle(() => editorRef.current?.textareaRef.current?.focus());
         } else {
           handle(startNewNoteCb);
         }
+      } else if (e.key === 's') {
+        handle(toggleNoteSelectionMode);
+      } else if (e.key === 'A' && app.showArchive) {
+        handle(unarchiveNoteSelection);
+      } else if (e.key === 'a' && !app.showArchive) {
+        handle(archiveNoteSelection);
       }
     }
 
     window.addEventListener('keydown', callback);
     return () => window.removeEventListener('keydown', callback);
   });
+
+  function archiveNoteSelection() {
+    const count = app.noteSelection?.length ?? 0;
+    if (count > 0 && confirm(`Are you sure you want to archive ${count} note(s)?`)) {
+      actions.archiveNoteSelection();
+    }
+  }
+
+  function unarchiveNoteSelection() {
+    const count = app.noteSelection?.length ?? 0;
+    if (count > 0 && confirm(`Are you sure you want to unarchive ${count} note(s)?`)) {
+      actions.unarchiveNoteSelection();
+    }
+  }
 
   function saveNewNote(changes: { text?: string | null; pinned?: number; not_deleted?: number }) {
     let savedNote = {
@@ -110,19 +162,13 @@ export function NotesPage(_props: NotesPageProps) {
   }
 
   async function cancelNewNoteCb() {
-    if (newNote) {
-      // It's possible that before we confirmed or cancelled the new note,
-      // it was changed from another session. In that case, we don't want
-      // to delete the note.
-      const noteInStorage = await storage.getNote(newNote.id);
-      if (!noteInStorage || !cutil.isNoteNewerThan(noteInStorage, newNote)) {
-        deleteNewNote();
-      }
+    if (!newNote || confirm('Are you sure you want to delete this note?')) {
+      deleteNewNote();
+      setNewNote(undefined);
+      setEditorOpen(false);
+      actions.updateNotes();
+      (document.activeElement as HTMLElement | undefined)?.blur();
     }
-    setNewNote(undefined);
-    setEditing(false);
-    actions.updateNotes();
-    (document.activeElement as HTMLElement | undefined)?.blur();
   }
 
   // async function askUserToCancelNewNoteCb() {
@@ -148,7 +194,7 @@ export function NotesPage(_props: NotesPageProps) {
   }, []);
 
   function editorFocusCb() {
-    setEditing(true);
+    setEditorOpen(true);
     setEditorFocused(true);
   }
 
@@ -159,11 +205,11 @@ export function NotesPage(_props: NotesPageProps) {
   // Cancel new note if editor is empty and has lost focus.
   useEffect(() => {
     let timeout: any;
-    if (editing && !editorFocused && !newNote?.text) {
+    if (editorOpen && !editorFocused && !newNote?.text) {
       timeout = setTimeout(() => cancelNewNoteCb(), 300);
     }
     return () => clearTimeout(timeout);
-  }, [editing, newNote, editorFocused, cancelNewNoteCb]);
+  }, [editorOpen, newNote, editorFocused, cancelNewNoteCb]);
 
   function togglePinned() {
     editorRef.current!.focus();
@@ -187,7 +233,7 @@ export function NotesPage(_props: NotesPageProps) {
     actions.updateNotes();
   }
 
-  function toggleSearchCb() {
+  function toggleNoteSearchCb() {
     appStore.update(app => {
       app.search = app.search === undefined ? '' : undefined;
     });
@@ -205,7 +251,7 @@ export function NotesPage(_props: NotesPageProps) {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      toggleSearchCb();
+      toggleNoteSearchCb();
     }
   }
 
@@ -214,14 +260,24 @@ export function NotesPage(_props: NotesPageProps) {
   }
 
   function startNewNoteCb() {
-    setEditing(true);
+    setEditorOpen(true);
     editorRef.current!.focus();
   }
 
+  function toggleNoteSelectionMode() {
+    appStore.update(app => {
+      app.noteSelection = app.noteSelection ? undefined : [];
+    });
+  }
+
   const pageActions: React.ReactNode[] = [];
-  if (editing) {
+  if (editorOpen) {
     pageActions.push(
-      <PageAction icon={icons.trashWhite} onClick={cancelNewNoteCb} title="Delete (Ctrl+Delete or Cmd+Delete)" />,
+      <PageAction
+        icon={icons.trashWhite}
+        onClick={cancelNewNoteCb}
+        title="Delete (Ctrl+Shift+Delete or Cmd+Shift+Delete)"
+      />,
       <PageAction
         icon={newNote?.pinned ? icons.pinFilledWhite : icons.pinEmptyWhite}
         onClick={togglePinned}
@@ -231,8 +287,21 @@ export function NotesPage(_props: NotesPageProps) {
       <PageAction icon={icons.checkWhite} onClick={confirmNewNoteCb} title="Done (Esc or Ctrl+Enter or Cmd+Enter)" />,
     );
   } else if (app.search === undefined) {
+    if (app.noteSelection) {
+      pageActions.push(
+        <PageAction
+          icon={icons.circleDeselectWhite}
+          onClick={toggleNoteSelectionMode}
+          title={'Clear selection (s or Esc)'}
+        />,
+      );
+    } else {
+      pageActions.push(
+        <PageAction icon={icons.circleSelectWhite} onClick={toggleNoteSelectionMode} title={'Select (s)'} />,
+      );
+    }
     pageActions.push(
-      <PageAction icon={icons.searchWhite} onClick={toggleSearchCb} title="Search (/)" />,
+      <PageAction icon={icons.searchWhite} onClick={toggleNoteSearchCb} title="Search (/)" />,
       <PageAction
         icon={app.hidePinnedNotes ? icons.hidePinnedWhite2 : icons.showPinnedWhite}
         onClick={toggleHidePinnedNotes}
@@ -256,8 +325,59 @@ export function NotesPage(_props: NotesPageProps) {
         onClick={toggleHidePinnedNotes}
         title={app.hidePinnedNotes ? 'Show pinned notes (p)' : 'Hide pinned notes (p)'}
       />,
-      <PageAction className="close-search" icon={icons.xWhite} onClick={toggleSearchCb} title="Close search (Esc)" />,
+      <PageAction
+        className="close-search"
+        icon={icons.xWhite}
+        onClick={toggleNoteSearchCb}
+        title="Close search (Esc)"
+      />,
     );
+  }
+
+  let secondRow: PageHeaderSecondRowProps | undefined;
+  if (app.noteSelection) {
+    // const allPinned = app.notes.every(note => note.pinned);
+    const allArchived = app.notes.every(note => !note.not_archived);
+
+    secondRow = {
+      title:
+        app.noteSelection.length === 0
+          ? 'Select notes'
+          : app.noteSelection.length === 1
+            ? '1 selected'
+            : `${app.noteSelection.length} selected`,
+      actions: [
+        allArchived ? (
+          <PageAction
+            icon={icons.archiveFilledWhite}
+            onClick={unarchiveNoteSelection}
+            title="Unarchive selection (Shift+a)"
+          />
+        ) : (
+          <PageAction icon={icons.archiveEmptyWhite} onClick={archiveNoteSelection} title="Archive selection (a)" />
+        ),
+        <PageAction
+          icon={icons.chevronDownDoubleWhite}
+          onClick={actions.moveNoteSelectionToBottom}
+          title="Move selection to the bottom (Ctrl+Shift+Down or Cmd+Shift+Down)"
+        />,
+        <PageAction
+          icon={icons.chevronUpDoubleWhite}
+          onClick={actions.moveNoteSelectionToTop}
+          title="Move selection to the top (Ctrl+Shift+Up or Cmd+Shift+Up)"
+        />,
+        <PageAction
+          icon={icons.chevronDownWhite}
+          onClick={actions.moveNoteSelectionDown}
+          title="Move selection down (Ctrl+Down or Cmd+Down)"
+        />,
+        <PageAction
+          icon={icons.chevronUpWhite}
+          onClick={actions.moveNoteSelectionUp}
+          title="Move selection up (Ctrl+Up or Cmd+Up)"
+        />,
+      ],
+    };
   }
 
   return (
@@ -265,15 +385,16 @@ export function NotesPage(_props: NotesPageProps) {
       <PageHeader
         actions={pageActions}
         title={app.showArchive ? '/ archive' : undefined}
-        hasSticky={stickyEditor && editing}
+        hasSticky={stickyEditor && editorOpen}
         hasSearch={app.search !== undefined}
+        secondRow={secondRow}
       />
       <PageBody>
         <div className="page notes-page">
           <div
             className={`new-note-container ${stickyEditor ? 'sticky' : ''} ${
-              stickyEditor && !editing ? 'invisible' : ''
-            }`}
+              stickyEditor && !editorOpen ? 'invisible' : ''
+            } ${secondRow ? 'below-second-row' : ''}`}
           >
             <Editor
               ref={editorRef}
@@ -309,7 +430,10 @@ const NotesFromApp = memo(function NotesFromApp(props: { hiddenNoteId?: string }
       hiddenNoteId={props.hiddenNoteId}
       onNoteChange={actions.saveNoteAndQuickUpdateNotes}
       onNoteClick={goToNote}
+      onToggleNoteSelection={actions.toggleNoteSelection}
+      noteSelection={app.noteSelection}
       hideContentAfterBreak
+      selectable
     />
   );
 });
@@ -319,11 +443,12 @@ function goToNote(note: t.Note) {
 }
 
 export async function notesPageLoader(match: RouteMatch) {
-  // Update app.showArchive when transitioning between / and /archive.
+  // Update app.showArchive and noteSelection when transitioning between / and /archive.
   appStore.update(app => {
     const showArchive = match.pathname === '/archive';
     if (showArchive !== app.showArchive) {
       app.showArchive = showArchive;
+      app.noteSelection = undefined;
       // app.notesUpdateRequestTimestamp = Date.now();
     }
   });
